@@ -43,6 +43,7 @@ Adjust the following variables in the `.env` file:
 
 - `TELEGRAM_BOT_TOKEN`: Your Telegram Bot API token
 - `OLLAMA_MODEL_NAME`: The name of the Ollama model you want to use
+(rename the .env.example file
 
 ## Contributing
 
