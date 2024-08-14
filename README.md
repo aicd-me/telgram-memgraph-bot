@@ -8,7 +8,7 @@ This project implements a Telegram bot with memory capabilities using Memgraph f
 - Context-aware responses
 - Entity, intent, and sentiment extraction
 - Gist generation for summarizing conversations
-- Feedback mechanism for bot responses
+- Feedback mechanism for bot responses (/feedback)
 
 ## Prerequisites
 
