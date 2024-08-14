@@ -4,6 +4,7 @@ import os
 import requests
 import asyncio
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
 from gqlalchemy import Memgraph
 from dotenv import load_dotenv
@@ -13,9 +14,9 @@ import time
 
 # Load environment variables
 load_dotenv()
- 
+
 # Configure logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.ERROR)
 
 # Telegram Bot Token from environment variable
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -44,12 +45,12 @@ class RateLimiter:
 telegram_limiter = RateLimiter(max_calls=1, time_frame=3)  # 1 call per 3 seconds
 
 async def start(update: Update, context: CallbackContext):
-    await update.message.reply_text("Hello! I'm your AI assistant. How can I help you?")
+    await update.message.reply_text("Hello! Happy to talk to you!")
 
 async def send_typing_indicator(context, chat_id):
     try:
         await telegram_limiter.wait()
-        await context.bot.send_chat_action(chat_id=chat_id, action='typing')
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     except Exception as e:
         logging.error(f"Error sending typing indicator: {e}")
 
@@ -57,7 +58,7 @@ async def update_gist_background(user_id, new_message):
     try:
         query = """
         MATCH (u:User {id: $user_id})-[:SENT]->(m:Message)
-        RETURN collect(m.`text`) AS messages
+        RETURN collect(m.`message_text`) AS messages
         """
         result = memgraph.execute_and_fetch(query, {"user_id": user_id})
         messages = next(result)['messages'] + [new_message]
@@ -66,18 +67,31 @@ async def update_gist_background(user_id, new_message):
         response = requests.post(OLLAMA_API, json={
             'model': OLLAMA_MODEL_NAME,
             'prompt': prompt
-        })
+        }, stream=True)
         response.raise_for_status()
-        new_gist = response.text.strip()
+        
+        # Collect response in parts
+        new_gist = ""
+        for line in response.iter_lines():
+            if line:
+                try:
+                    line_decoded = json.loads(line.decode('utf-8'))
+                    new_gist += line_decoded.get('response', '').strip()
+                except json.JSONDecodeError as json_err:
+                    logging.error(f"JSON decode error: {json_err}")
+                    logging.error(f"Raw response text: {line}")
+                    return
 
+        # Store in Memgraph
         store_query = """
         MERGE (u:User {id: $user_id})
         SET u.gist = $gist
         """
         memgraph.execute(store_query, {"user_id": user_id, "gist": new_gist})
-
     except Exception as e:
         logging.error(f"Failed to update gist: {e}")
+
+
 
 def retrieve_conversation_history(user_id, current_message):
     query = """
@@ -93,27 +107,27 @@ def retrieve_conversation_history(user_id, current_message):
             history.append({
                 "user_message": record['user_message'],
                 "ai_response": record['ai_response'],
-                "timestamp": record['timestamp']
+                "timestamp": record["timestamp"]
             })
-        
+
         if not history:
             return "No previous conversation history."
-        
+
         # Use semantic similarity to select the most relevant messages
         vectorizer = TfidfVectorizer()
         corpus = [current_message] + [f"{h['user_message']} {h['ai_response']}" for h in history]
         tfidf_matrix = vectorizer.fit_transform(corpus)
         cosine_similarities = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
-        
+
         # Select top 5 most similar messages
         top_indices = cosine_similarities.argsort()[-5:][::-1]
         relevant_history = [history[i] for i in top_indices]
-        
+
         # Format the relevant history
         formatted_history = []
         for h in relevant_history:
             formatted_history.append(f"User: {h['user_message']}\nAI: {h['ai_response']}")
-        
+
         return '\n'.join(formatted_history)
     except Exception as e:
         logging.error(f"Failed to retrieve conversation history: {e}")
@@ -122,12 +136,18 @@ def retrieve_conversation_history(user_id, current_message):
 def retrieve_conversation_gist(user_id):
     query = """
     MATCH (u:User {id: $user_id})
-    RETURN u.gist AS gist
+    OPTIONAL MATCH (u)-[:INTERESTED_IN]->(i:Interest)
+    RETURN u.gist AS gist, u.name AS name, u.age AS age, u.location AS location, u.occupation AS occupation,
+           collect(i.name) AS interests
     """
     try:
         result = memgraph.execute_and_fetch(query, {"user_id": user_id})
-        gist = next(result, {}).get('gist', '')
-        return gist if gist else "No conversation gist available."
+        user_data = next(result, {})
+        gist = user_data.get('gist', '')
+        profile_info = (f"User Profile: Name: {user_data.get('name')}, Age: {user_data.get('age')}, "
+                        f"Location: {user_data.get('location')}, Occupation: {user_data.get('occupation')}, "
+                        f"Interests: {', '.join(user_data.get('interests', []))}")
+        return f"{profile_info}\n\nConversation Gist: {gist}" if gist else "No conversation gist available."
     except Exception as e:
         logging.error(f"Failed to retrieve conversation gist: {e}")
         return "Error retrieving conversation gist."
@@ -136,7 +156,19 @@ async def extract_entities(user_message, ai_response):
     try:
         semantic_response = requests.post(OLLAMA_API, json={
             'model': OLLAMA_MODEL_NAME,
-            'prompt': f"Extract entities, intents, and sentiments from the following conversation:\nUser: {user_message}\nAI: {ai_response}"
+            'prompt': f"""Extract entities, intents, and sentiments from the following conversation:
+            User: {user_message}
+            AI: {ai_response}
+            
+            Please pay special attention to the following entity types:
+            - PERSON (for names)
+            - AGE
+            - GPE (for locations)
+            - OCCUPATION
+            - INTEREST (for hobbies or topics of interest)
+            
+            Also, identify intents related to expressing interests, such as 'interest_in_sports' or 'interest_in_technology'.
+            """
         }, stream=True)
         semantic_response.raise_for_status()
 
@@ -187,32 +219,90 @@ async def extract_entities(user_message, ai_response):
         logging.error(f"Failed to extract semantic data: {e}")
         return [], [], {}
 
+async def update_user_profile(user_id, user_message, entities, intents):
+    profile_fields = {
+        "name": None,
+        "age": None,
+        "location": None,
+        "interests": [],
+        "occupation": None
+    }
+
+    # Extract profile information from entities
+    for entity in entities:
+        if entity['type'] == 'PERSON':
+            profile_fields['name'] = entity['name']
+        elif entity['type'] == 'AGE':
+            profile_fields['age'] = entity['name']
+        elif entity['type'] == 'GPE':
+            profile_fields['location'] = entity['name']
+        elif entity['type'] == 'OCCUPATION':
+            profile_fields['occupation'] = entity['name']
+
+    # Extract interests from intents
+    for intent in intents:
+        if intent.lower().startswith('interest_in_'):
+            profile_fields['interests'].append(intent.split('_')[-1])
+
+    # Update user profile in Memgraph
+    query = """
+    MERGE (u:User {id: $user_id})
+    SET u.name = COALESCE($name, u.name),
+        u.age = COALESCE($age, u.age),
+        u.location = COALESCE($location, u.location),
+        u.occupation = COALESCE($occupation, u.occupation)
+    WITH u
+    UNWIND $interests AS interest
+    MERGE (i:Interest {name: interest})
+    MERGE (u)-[:INTERESTED_IN]->(i)
+    """
+    memgraph.execute(query, {
+        "user_id": user_id,
+        "name": profile_fields['name'],
+        "age": profile_fields['age'],
+        "location": profile_fields['location'],
+        "occupation": profile_fields['occupation'],
+        "interests": profile_fields['interests']
+    })
+
 async def handle_message(update: Update, context: CallbackContext):
+    chat_type = update.effective_chat.type
+    logging.info(f"Chat type: {chat_type}")
+    if chat_type in ['group', 'supergroup']:
+        logging.info("GROUP HANDLING")
+        if await is_bot_mentioned_or_replied(update, context):
+            logging.info("BOT MENTIONED OR REPLIED")
+            # Add further handling logic here
+
+            await handle_bot_mention(update, context)
+        else:
+            await handle_group_message(update, context)
+    else:
+        # Private chat logic
+        await handle_private_message(update, context)
+
+async def handle_private_message(update: Update, context: CallbackContext):
     user_message = update.message.text
     ai_response = ""
-    
+    user_id = update.effective_user.id
+
     try:
         # Send initial typing indicator
         await send_typing_indicator(context, update.effective_chat.id)
 
         # Retrieve conversation history and gist
-        history = retrieve_conversation_history(update.effective_user.id, user_message)
-        gist = retrieve_conversation_gist(update.effective_user.id)
-
+        history = retrieve_conversation_history(user_id, user_message)
+        gist = retrieve_conversation_gist(user_id)
         logging.info(f"Retrieved history: {history}")
         logging.info(f"Retrieved gist: {gist}")
 
         # Combine history and gist in the prompt for LLM context
-        combined_context = f"""Here is a summary of the conversation for context:
-{gist}
-
-Here are the most relevant previous messages:
-{history}
-
-Now respond to the user message below. Use the context to inform your response, but do not explicitly mention or repeat the context. Focus on providing a direct and relevant answer to the user's current message.
-
-User: {user_message}
-AI:"""
+        combined_context = f"""Here is a summary of the conversation for context: {gist}
+        Here are the most relevant previous messages: {history}
+        Now respond to the user message below. Use the context to inform your response, but do not explicitly mention or repeat the context.
+        Focus on providing a direct and relevant answer to the user's current message.
+        User: {user_message}
+        AI:"""
 
         # Ollama inference with streaming
         response = requests.post(OLLAMA_API, json={
@@ -235,16 +325,20 @@ AI:"""
                     logging.error(f"Failed to decode JSON chunk: {e}")
 
         ai_response = buffer
-        await update.message.reply_text(ai_response)
+        if update.message:
+            await update.message.reply_text(ai_response)
 
-        # Extract entities, intents, and sentiments in parallel
+        # Extract entities, intents, and sentiments
         intents, entities, sentiments = await extract_entities(user_message, ai_response)
+
+        # Update user profile
+        await update_user_profile(user_id, user_message, entities, intents)
 
         # Store conversation and semantic data in Memgraph
         query = """
         MERGE (u:User {id: $user_id})
-        CREATE (u_msg:Message {`text`: $user_message, timestamp: timestamp(), type: 'user'})
-        CREATE (ai_msg:Message {`text`: $ai_response, timestamp: timestamp(), type: 'ai'})
+        CREATE (u_msg:Message {message_text: $user_message, timestamp: timestamp(), type: 'user'})
+        CREATE (ai_msg:Message {message_text: $ai_response, timestamp: timestamp(), type: 'ai'})
         MERGE (u)-[:SENT]->(u_msg)
         MERGE (u_msg)-[:RESPONDED_WITH]->(ai_msg)
         FOREACH (intent IN $intents | MERGE (i:Intent {name: intent}) CREATE (u_msg)-[:HAS_INTENT]->(i))
@@ -256,9 +350,8 @@ AI:"""
         MERGE (t:Topic {name: i.name})
         MERGE (u_msg)-[:RELATES_TO]->(t)
         """
-
         memgraph.execute(query, {
-            "user_id": update.effective_user.id,
+            "user_id": user_id,
             "user_message": user_message,
             "ai_response": ai_response,
             "intents": intents,
@@ -268,11 +361,12 @@ AI:"""
         })
 
         # Start background task to update gist
-        asyncio.create_task(update_gist_background(update.effective_user.id, user_message))
+        asyncio.create_task(update_gist_background(user_id, user_message))
 
     except Exception as e:
         logging.error(f"Error in handle_message: {e}")
         await update.message.reply_text("I apologize, but I encountered an error while processing your message. Please try again later.")
+
 
 async def feedback(update: Update, context: CallbackContext):
     feedback_text = update.message.text.lower()
@@ -280,20 +374,17 @@ async def feedback(update: Update, context: CallbackContext):
         last_message_query = """
         MATCH (u:User {id: $user_id})-[:SENT]->(m:Message)-[:RESPONDED_WITH]->(r:Message)
         WHERE NOT EXISTS((r)-[:HAS_FEEDBACK]->())
-        RETURN r
-        ORDER BY r.timestamp DESC
-        LIMIT 1
+        RETURN r ORDER BY r.timestamp DESC LIMIT 1
         """
         result = memgraph.execute_and_fetch(last_message_query, {"user_id": update.effective_user.id})
         last_ai_message = next(result, None)
-
         if last_ai_message:
             feedback_query = """
             MATCH (m:Message {id: $message_id})
             CREATE (m)-[:HAS_FEEDBACK]->(:Feedback {value: $feedback})
             """
             memgraph.execute(feedback_query, {
-                "message_id": last_ai_message['r'].id,
+                "message_id": last_ai_message['id'],
                 "feedback": feedback_text == 'helpful'
             })
             await update.message.reply_text("Thank you for your feedback!")
@@ -301,6 +392,110 @@ async def feedback(update: Update, context: CallbackContext):
             await update.message.reply_text("I couldn't find a recent message to apply feedback to.")
     else:
         await update.message.reply_text("Please provide feedback by saying 'helpful' or 'not helpful'.")
+
+async def is_bot_mentioned_or_replied(update: Update, context: CallbackContext) -> bool:
+    message = update.message
+    if message is None:
+        return False
+    
+    if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id:
+        return True
+    
+    if context.bot.username in message.text:
+        return True
+    
+    return False
+
+
+async def handle_group_message(update: Update, context: CallbackContext):
+    user_message = update.message.text
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # Corrected Cypher query
+    query = """
+    MERGE (u:User {id: $user_id})
+    CREATE (m:Message {message_text: $message, timestamp: timestamp(), type: 'user', chat_id: $chat_id})
+    MERGE (u)-[:SENT]->(m)
+    """
+    try:
+        memgraph.execute(query, {
+            "user_id": user_id,
+            "message": user_message,
+            "chat_id": chat_id
+        })
+    except Exception as e:
+        logging.error(f"Error storing group message: {e}")
+
+    # Update the gist in the background
+    asyncio.create_task(update_gist_background(chat_id, user_message))
+
+
+
+async def handle_bot_mention(update: Update, context: CallbackContext):
+    user_message = update.message.text
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id  # Ensure user_id captures the user that sent the message in the group
+
+    # Retrieve conversation history and gist
+    history = retrieve_conversation_history(chat_id, user_message)
+    gist = retrieve_conversation_gist(chat_id)
+
+    # Generate response using Ollama
+    combined_context = f"""Here is a summary of the conversation for context: {gist}
+    Here are the most relevant previous messages: {history}
+    Now respond to the user message below. Use the context to inform your response, but do not explicitly mention or repeat the context.
+    Focus on providing a direct and relevant answer to the user's current message.
+    User: {user_message}
+    AI:"""
+    try:
+        response = requests.post(OLLAMA_API, json={
+            'model': OLLAMA_MODEL_NAME,
+            'prompt': combined_context
+        }, stream=True)
+        response.raise_for_status()
+
+        ai_response = ""
+        partial_responses = []
+
+        # Process streaming response
+        for line in response.iter_lines():
+            if line:
+                logging.info(f"Interim response line: {line}")
+                try:
+                    json_line = json.loads(line)
+                    partial_responses.append(json_line.get('response', ''))
+                    if json_line.get('done', False):
+                        break
+                except json.JSONDecodeError as json_err:
+                    logging.error(f"JSON decode error: {json_err}")
+                    logging.error(f"Raw response text: {line}")
+                    await update.message.reply_text("I encountered an error while processing the response. Please try again later.")
+                    return
+
+        ai_response = ''.join(partial_responses)
+        await update.message.reply_text(ai_response)
+        
+        # Updated Cypher query
+        query = """
+        MERGE (u:User {id: $user_id})
+        CREATE (m:Message {message_text: $message, timestamp: timestamp(), type: 'bot', chat_id: $chat_id})
+        MERGE (u)-[:SENT]->(m)
+        """
+        memgraph.execute(query, {
+            "user_id": context.bot.id,
+            "message": ai_response,
+            "chat_id": chat_id
+        })
+
+    except requests.RequestException as req_err:
+        logging.error(f"Request error: {req_err}")
+        await update.message.reply_text("I encountered a network error. Please try again later.")
+    except Exception as e:
+        logging.error(f"Error handling bot mention: {e}")
+        await update.message.reply_text("I encountered an error. Please try again later.")
+
+
 
 def main():
     application = Application.builder().token(TOKEN).build()
