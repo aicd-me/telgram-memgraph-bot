@@ -28,6 +28,17 @@ OLLAMA_MODEL_NAME = os.getenv('OLLAMA_MODEL_NAME', 'llama3:8b-instruct-q8_0')
 # Memgraph connection
 memgraph = Memgraph()
 
+def execute_with_retry(query, params, retries=3, delay=5):
+    for i in range(retries):
+        try:
+            return memgraph.execute(query, params)
+        except Exception as e:
+            logging.error(f"Attempt {i+1} failed with error: {e}")
+            if i < retries - 1:
+                time.sleep(delay)
+            else:
+                raise
+
 class RateLimiter:
     def __init__(self, max_calls, time_frame):
         self.max_calls = max_calls
@@ -50,7 +61,9 @@ async def start(update: Update, context: CallbackContext):
 async def send_typing_indicator(context, chat_id):
     try:
         await telegram_limiter.wait()
+        
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        await asyncio.sleep(1)  # Add a delay to avoid flood control issues
     except Exception as e:
         logging.error(f"Error sending typing indicator: {e}")
 
@@ -93,15 +106,16 @@ async def update_gist_background(user_id, new_message):
 
 
 
-def retrieve_conversation_history(user_id, current_message):
-    query = """
-    MATCH (u:User {id: $user_id})-[:SENT]->(m:Message)-[:RESPONDED_WITH]->(r:Message)
-    RETURN m.`text` AS user_message, r.`text` AS ai_response, m.timestamp AS timestamp
+def retrieve_conversation_history(entity_id, current_message, is_group=False):
+    entity_label = 'Group' if is_group else 'User'
+    query = f"""
+    MATCH (e:{entity_label} {{id: $entity_id}})-[:SENT]->(m:Message)-[:RESPONDED_WITH]->(r:Message)
+    RETURN m.`message_text` AS user_message, r.`message_text` AS ai_response, m.timestamp AS timestamp
     ORDER BY m.timestamp DESC
     LIMIT 20
     """
     try:
-        result = memgraph.execute_and_fetch(query, {"user_id": user_id})
+        result = memgraph.execute_and_fetch(query, {"entity_id": entity_id})
         history = []
         for record in result:
             history.append({
@@ -133,24 +147,24 @@ def retrieve_conversation_history(user_id, current_message):
         logging.error(f"Failed to retrieve conversation history: {e}")
         return "Error retrieving conversation history."
 
-def retrieve_conversation_gist(user_id):
-    query = """
-    MATCH (u:User {id: $user_id})
-    OPTIONAL MATCH (u)-[:INTERESTED_IN]->(i:Interest)
-    RETURN u.gist AS gist, u.name AS name, u.age AS age, u.location AS location, u.occupation AS occupation,
-           collect(i.name) AS interests
+
+def retrieve_conversation_gist(entity_id, is_group=False):
+    entity_label = 'Group' if is_group else 'User'
+    query = f"""
+    MATCH (e:{entity_label} {{id: $entity_id}})
+    OPTIONAL MATCH (e)-[:INTERESTED_IN]->(i:Interest)
+    RETURN e.gist AS gist, e.name AS name, collect(i.name) AS interests
     """
     try:
-        result = memgraph.execute_and_fetch(query, {"user_id": user_id})
-        user_data = next(result, {})
-        gist = user_data.get('gist', '')
-        profile_info = (f"User Profile: Name: {user_data.get('name')}, Age: {user_data.get('age')}, "
-                        f"Location: {user_data.get('location')}, Occupation: {user_data.get('occupation')}, "
-                        f"Interests: {', '.join(user_data.get('interests', []))}")
+        result = memgraph.execute_and_fetch(query, {"entity_id": entity_id})
+        entity_data = next(result, {})
+        gist = entity_data.get('gist', '')
+        profile_info = f"Name: {entity_data.get('name')}, Interests: {', '.join(entity_data.get('interests', []))}"
         return f"{profile_info}\n\nConversation Gist: {gist}" if gist else "No conversation gist available."
     except Exception as e:
         logging.error(f"Failed to retrieve conversation gist: {e}")
         return "Error retrieving conversation gist."
+
 
 async def extract_entities(user_message, ai_response):
     try:
@@ -219,7 +233,7 @@ async def extract_entities(user_message, ai_response):
         logging.error(f"Failed to extract semantic data: {e}")
         return [], [], {}
 
-async def update_user_profile(user_id, user_message, entities, intents):
+async def update_user_profile(entity_id, user_message, entities, intents, is_group=False):
     profile_fields = {
         "name": None,
         "age": None,
@@ -244,20 +258,21 @@ async def update_user_profile(user_id, user_message, entities, intents):
         if intent.lower().startswith('interest_in_'):
             profile_fields['interests'].append(intent.split('_')[-1])
 
-    # Update user profile in Memgraph
-    query = """
-    MERGE (u:User {id: $user_id})
-    SET u.name = COALESCE($name, u.name),
-        u.age = COALESCE($age, u.age),
-        u.location = COALESCE($location, u.location),
-        u.occupation = COALESCE($occupation, u.occupation)
-    WITH u
+    # Update user or group profile in Memgraph
+    entity_label = 'Group' if is_group else 'User'
+    query = f"""
+    MERGE (e:{entity_label} {{id: $entity_id}})
+    SET e.name = COALESCE($name, e.name),
+        e.age = COALESCE($age, e.age),
+        e.location = COALESCE($location, e.location),
+        e.occupation = COALESCE($occupation, e.occupation)
+    WITH e
     UNWIND $interests AS interest
-    MERGE (i:Interest {name: interest})
-    MERGE (u)-[:INTERESTED_IN]->(i)
+    MERGE (i:Interest {{name: interest}})
+    MERGE (e)-[:INTERESTED_IN]->(i)
     """
     memgraph.execute(query, {
-        "user_id": user_id,
+        "entity_id": entity_id,
         "name": profile_fields['name'],
         "age": profile_fields['age'],
         "location": profile_fields['location'],
@@ -265,34 +280,26 @@ async def update_user_profile(user_id, user_message, entities, intents):
         "interests": profile_fields['interests']
     })
 
+
 async def handle_message(update: Update, context: CallbackContext):
     chat_type = update.effective_chat.type
-    logging.info(f"Chat type: {chat_type}")
-    if chat_type in ['group', 'supergroup']:
-        logging.info("GROUP HANDLING")
-        if await is_bot_mentioned_or_replied(update, context):
-            logging.info("BOT MENTIONED OR REPLIED")
-            # Add further handling logic here
-
-            await handle_bot_mention(update, context)
-        else:
-            await handle_group_message(update, context)
-    else:
-        # Private chat logic
-        await handle_private_message(update, context)
-
-async def handle_private_message(update: Update, context: CallbackContext):
+    is_group = chat_type in ['group', 'supergroup']
+    entity_id = update.effective_chat.id if is_group else update.effective_user.id
     user_message = update.message.text
-    ai_response = ""
-    user_id = update.effective_user.id
+
+    # Check if the bot is mentioned or the message is a reply to the bot's message in a group chat
+    if is_group:
+        if not await is_bot_mentioned_or_replied(update, context):
+            logging.info("Bot not mentioned or replied to. Ignoring message.")
+            return
 
     try:
         # Send initial typing indicator
         await send_typing_indicator(context, update.effective_chat.id)
 
         # Retrieve conversation history and gist
-        history = retrieve_conversation_history(user_id, user_message)
-        gist = retrieve_conversation_gist(user_id)
+        history = retrieve_conversation_history(entity_id, user_message, is_group)
+        gist = retrieve_conversation_gist(entity_id, is_group)
         logging.info(f"Retrieved history: {history}")
         logging.info(f"Retrieved gist: {gist}")
 
@@ -331,41 +338,69 @@ async def handle_private_message(update: Update, context: CallbackContext):
         # Extract entities, intents, and sentiments
         intents, entities, sentiments = await extract_entities(user_message, ai_response)
 
-        # Update user profile
-        await update_user_profile(user_id, user_message, entities, intents)
+        # Update user or group profile
+        await update_user_profile(entity_id, user_message, entities, intents, is_group)
 
         # Store conversation and semantic data in Memgraph
-        query = """
-        MERGE (u:User {id: $user_id})
-        CREATE (u_msg:Message {message_text: $user_message, timestamp: timestamp(), type: 'user'})
-        CREATE (ai_msg:Message {message_text: $ai_response, timestamp: timestamp(), type: 'ai'})
-        MERGE (u)-[:SENT]->(u_msg)
-        MERGE (u_msg)-[:RESPONDED_WITH]->(ai_msg)
-        FOREACH (intent IN $intents | MERGE (i:Intent {name: intent}) CREATE (u_msg)-[:HAS_INTENT]->(i))
-        FOREACH (entity IN $entities | MERGE (e:Entity {name: entity.name, type: entity.type}) CREATE (u_msg)-[:HAS_ENTITY]->(e))
-        CREATE (u_msg)-[:HAS_SENTIMENT]->(:Sentiment {sentiment: $sentiment_user})
-        CREATE (ai_msg)-[:HAS_SENTIMENT]->(:Sentiment {sentiment: $sentiment_ai})
-        WITH u_msg
-        MATCH (u_msg)-[:HAS_INTENT]->(i:Intent)
-        MERGE (t:Topic {name: i.name})
-        MERGE (u_msg)-[:RELATES_TO]->(t)
-        """
-        memgraph.execute(query, {
-            "user_id": user_id,
-            "user_message": user_message,
-            "ai_response": ai_response,
-            "intents": intents,
-            "entities": entities,
-            "sentiment_user": sentiments.get('overall', 'neutral'),
-            "sentiment_ai": sentiments.get('overall', 'neutral')
-        })
+        if is_group:
+            query = """
+            MERGE (g:Group {id: $chat_id})
+            CREATE (g_msg:Message {message_text: $user_message, timestamp: timestamp(), type: 'user'})
+            CREATE (ai_msg:Message {message_text: $ai_response, timestamp: timestamp(), type: 'ai'})
+            MERGE (g)-[:SENT]->(g_msg)
+            MERGE (g_msg)-[:RESPONDED_WITH]->(ai_msg)
+            FOREACH (intent IN $intents | MERGE (i:Intent {name: intent}) CREATE (g_msg)-[:HAS_INTENT]->(i))
+            FOREACH (entity IN $entities | MERGE (e:Entity {name: entity.name, type: entity.type}) CREATE (g_msg)-[:HAS_ENTITY]->(e))
+            CREATE (g_msg)-[:HAS_SENTIMENT]->(:Sentiment {sentiment: $sentiment_user})
+            CREATE (ai_msg)-[:HAS_SENTIMENT]->(:Sentiment {sentiment: $sentiment_ai})
+            WITH g_msg
+            MATCH (g_msg)-[:HAS_INTENT]->(i:Intent)
+            MERGE (t:Topic {name: i.name})
+            MERGE (g_msg)-[:RELATES_TO]->(t)
+            """
+            memgraph.execute(query, {
+                "chat_id": entity_id,
+                "user_message": user_message,
+                "ai_response": ai_response,
+                "intents": intents,
+                "entities": entities,
+                "sentiment_user": sentiments.get('overall', 'neutral'),
+                "sentiment_ai": sentiments.get('overall', 'neutral')
+            })
+        else:
+            query = """
+            MERGE (u:User {id: $user_id})
+            CREATE (u_msg:Message {message_text: $user_message, timestamp: timestamp(), type: 'user'})
+            CREATE (ai_msg:Message {message_text: $ai_response, timestamp: timestamp(), type: 'ai'})
+            MERGE (u)-[:SENT]->(u_msg)
+            MERGE (u_msg)-[:RESPONDED_WITH]->(ai_msg)
+            FOREACH (intent IN $intents | MERGE (i:Intent {name: intent}) CREATE (u_msg)-[:HAS_INTENT]->(i))
+            FOREACH (entity IN $entities | MERGE (e:Entity {name: entity.name, type: entity.type}) CREATE (u_msg)-[:HAS_ENTITY]->(e))
+            CREATE (u_msg)-[:HAS_SENTIMENT]->(:Sentiment {sentiment: $sentiment_user})
+            CREATE (ai_msg)-[:HAS_SENTIMENT]->(:Sentiment {sentiment: $sentiment_ai})
+            WITH u_msg
+            MATCH (u_msg)-[:HAS_INTENT]->(i:Intent)
+            MERGE (t:Topic {name: i.name})
+            MERGE (u_msg)-[:RELATES_TO]->(t)
+            """
+            memgraph.execute(query, {
+                "user_id": entity_id,
+                "user_message": user_message,
+                "ai_response": ai_response,
+                "intents": intents,
+                "entities": entities,
+                "sentiment_user": sentiments.get('overall', 'neutral'),
+                "sentiment_ai": sentiments.get('overall', 'neutral')
+            })
 
         # Start background task to update gist
-        asyncio.create_task(update_gist_background(user_id, user_message))
+        asyncio.create_task(update_gist_background(entity_id, user_message))
 
     except Exception as e:
         logging.error(f"Error in handle_message: {e}")
         await update.message.reply_text("I apologize, but I encountered an error while processing your message. Please try again later.")
+
+
 
 
 async def feedback(update: Update, context: CallbackContext):
@@ -408,18 +443,26 @@ async def is_bot_mentioned_or_replied(update: Update, context: CallbackContext) 
 
 
 async def handle_group_message(update: Update, context: CallbackContext):
+    if update.message is None or update.message.text is None:
+        logging.error("Received an update without a message or text. Skipping processing.")
+        return
+
+    # Only proceed if the bot is mentioned or replied to
+    if not await is_bot_mentioned_or_replied(update, context):
+        logging.info("Bot not mentioned or replied to. Ignoring message.")
+        return
+
     user_message = update.message.text
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    # Corrected Cypher query
     query = """
     MERGE (u:User {id: $user_id})
     CREATE (m:Message {message_text: $message, timestamp: timestamp(), type: 'user', chat_id: $chat_id})
     MERGE (u)-[:SENT]->(m)
     """
     try:
-        memgraph.execute(query, {
+        execute_with_retry(query, {
             "user_id": user_id,
             "message": user_message,
             "chat_id": chat_id
@@ -427,8 +470,8 @@ async def handle_group_message(update: Update, context: CallbackContext):
     except Exception as e:
         logging.error(f"Error storing group message: {e}")
 
-    # Update the gist in the background
     asyncio.create_task(update_gist_background(chat_id, user_message))
+
 
 
 
@@ -459,12 +502,16 @@ async def handle_bot_mention(update: Update, context: CallbackContext):
         partial_responses = []
 
         # Process streaming response
-        for line in response.iter_lines():
+        for i, line in enumerate(response.iter_lines()):
             if line:
                 logging.info(f"Interim response line: {line}")
                 try:
                     json_line = json.loads(line)
                     partial_responses.append(json_line.get('response', ''))
+
+                    # Send typing indicator asynchronously every 3 lines
+                    if i == 0:
+                        await(send_typing_indicator(context, chat_id))
                     if json_line.get('done', False):
                         break
                 except json.JSONDecodeError as json_err:
